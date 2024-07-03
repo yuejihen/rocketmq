@@ -19,16 +19,17 @@ package org.apache.rocketmq.store;
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.ByteBufAllocator;
 import io.netty.buffer.UnpooledByteBufAllocator;
+import java.nio.ByteBuffer;
 import org.apache.rocketmq.common.UtilAll;
 import org.apache.rocketmq.common.constant.LoggerName;
 import org.apache.rocketmq.common.message.MessageDecoder;
 import org.apache.rocketmq.common.message.MessageExtBatch;
 import org.apache.rocketmq.common.message.MessageExtBrokerInner;
+import org.apache.rocketmq.common.message.MessageVersion;
 import org.apache.rocketmq.common.sysflag.MessageSysFlag;
 import org.apache.rocketmq.logging.org.slf4j.Logger;
 import org.apache.rocketmq.logging.org.slf4j.LoggerFactory;
-
-import java.nio.ByteBuffer;
+import org.apache.rocketmq.store.config.MessageStoreConfig;
 
 public class MessageExtEncoder {
     protected static final Logger log = LoggerFactory.getLogger(LoggerName.STORE_LOGGER_NAME);
@@ -37,20 +38,32 @@ public class MessageExtEncoder {
     private int maxMessageBodySize;
     // The maximum length of the full message.
     private int maxMessageSize;
-    public MessageExtEncoder(final int maxMessageBodySize) {
+    private final int crc32ReservedLength;
+    private MessageStoreConfig messageStoreConfig;
+
+    public MessageExtEncoder(final int maxMessageBodySize, final MessageStoreConfig messageStoreConfig) {
+        this(messageStoreConfig);
+    }
+
+    public MessageExtEncoder(final MessageStoreConfig messageStoreConfig) {
         ByteBufAllocator alloc = UnpooledByteBufAllocator.DEFAULT;
+        this.messageStoreConfig = messageStoreConfig;
+        this.maxMessageBodySize = messageStoreConfig.getMaxMessageSize();
         //Reserve 64kb for encoding buffer outside body
         int maxMessageSize = Integer.MAX_VALUE - maxMessageBodySize >= 64 * 1024 ?
             maxMessageBodySize + 64 * 1024 : Integer.MAX_VALUE;
         byteBuf = alloc.directBuffer(maxMessageSize);
-        this.maxMessageBodySize = maxMessageBodySize;
         this.maxMessageSize = maxMessageSize;
+        this.crc32ReservedLength = messageStoreConfig.isEnabledAppendPropCRC() ? CommitLog.CRC32_RESERVED_LEN : 0;
     }
 
-    public static int calMsgLength(int sysFlag, int bodyLength, int topicLength, int propertiesLength) {
+    public static int calMsgLength(MessageVersion messageVersion,
+        int sysFlag, int bodyLength, int topicLength, int propertiesLength) {
+
         int bornhostLength = (sysFlag & MessageSysFlag.BORNHOST_V6_FLAG) == 0 ? 8 : 20;
         int storehostAddressLength = (sysFlag & MessageSysFlag.STOREHOSTADDRESS_V6_FLAG) == 0 ? 8 : 20;
-        final int msgLen = 4 //TOTALSIZE
+
+        return 4 //TOTALSIZE
             + 4 //MAGICCODE
             + 4 //BODYCRC
             + 4 //QUEUEID
@@ -65,23 +78,120 @@ public class MessageExtEncoder {
             + 4 //RECONSUMETIMES
             + 8 //Prepared Transaction Offset
             + 4 + (Math.max(bodyLength, 0)) //BODY
-            + 1 + topicLength //TOPIC
+            + messageVersion.getTopicLengthSize() + topicLength //TOPIC
             + 2 + (Math.max(propertiesLength, 0)); //propertiesLength
-        return msgLen;
+    }
+
+    public static int calMsgLengthNoProperties(MessageVersion messageVersion,
+                                               int sysFlag, int bodyLength, int topicLength) {
+
+        int bornhostLength = (sysFlag & MessageSysFlag.BORNHOST_V6_FLAG) == 0 ? 8 : 20;
+        int storehostAddressLength = (sysFlag & MessageSysFlag.STOREHOSTADDRESS_V6_FLAG) == 0 ? 8 : 20;
+
+        return 4 //TOTALSIZE
+                + 4 //MAGICCODE
+                + 4 //BODYCRC
+                + 4 //QUEUEID
+                + 4 //FLAG
+                + 8 //QUEUEOFFSET
+                + 8 //PHYSICALOFFSET
+                + 4 //SYSFLAG
+                + 8 //BORNTIMESTAMP
+                + bornhostLength //BORNHOST
+                + 8 //STORETIMESTAMP
+                + storehostAddressLength //STOREHOSTADDRESS
+                + 4 //RECONSUMETIMES
+                + 8 //Prepared Transaction Offset
+                + 4 + (Math.max(bodyLength, 0)) //BODY
+                + messageVersion.getTopicLengthSize() + topicLength; //TOPIC
+    }
+
+    public PutMessageResult encodeWithoutProperties(MessageExtBrokerInner msgInner) {
+
+        final byte[] topicData = msgInner.getTopic().getBytes(MessageDecoder.CHARSET_UTF8);
+        final int topicLength = topicData.length;
+
+        final int bodyLength = msgInner.getBody() == null ? 0 : msgInner.getBody().length;
+
+        // Exceeds the maximum message body
+        if (bodyLength > this.maxMessageBodySize) {
+            CommitLog.log.warn("message body size exceeded, msg body size: " + bodyLength
+                    + ", maxMessageSize: " + this.maxMessageBodySize);
+            return new PutMessageResult(PutMessageStatus.MESSAGE_ILLEGAL, null);
+        }
+
+        final int msgLenNoProperties = calMsgLengthNoProperties(msgInner.getVersion(), msgInner.getSysFlag(), bodyLength, topicLength);
+
+        // 1 TOTALSIZE
+        this.byteBuf.writeInt(msgLenNoProperties);
+        // 2 MAGICCODE
+        this.byteBuf.writeInt(msgInner.getVersion().getMagicCode());
+        // 3 BODYCRC
+        this.byteBuf.writeInt(msgInner.getBodyCRC());
+        // 4 QUEUEID
+        this.byteBuf.writeInt(msgInner.getQueueId());
+        // 5 FLAG
+        this.byteBuf.writeInt(msgInner.getFlag());
+        // 6 QUEUEOFFSET, need update later
+        this.byteBuf.writeLong(0);
+        // 7 PHYSICALOFFSET, need update later
+        this.byteBuf.writeLong(0);
+        // 8 SYSFLAG
+        this.byteBuf.writeInt(msgInner.getSysFlag());
+        // 9 BORNTIMESTAMP
+        this.byteBuf.writeLong(msgInner.getBornTimestamp());
+
+        // 10 BORNHOST
+        ByteBuffer bornHostBytes = msgInner.getBornHostBytes();
+        this.byteBuf.writeBytes(bornHostBytes.array());
+
+        // 11 STORETIMESTAMP
+        this.byteBuf.writeLong(msgInner.getStoreTimestamp());
+
+        // 12 STOREHOSTADDRESS
+        ByteBuffer storeHostBytes = msgInner.getStoreHostBytes();
+        this.byteBuf.writeBytes(storeHostBytes.array());
+
+        // 13 RECONSUMETIMES
+        this.byteBuf.writeInt(msgInner.getReconsumeTimes());
+        // 14 Prepared Transaction Offset
+        this.byteBuf.writeLong(msgInner.getPreparedTransactionOffset());
+        // 15 BODY
+        this.byteBuf.writeInt(bodyLength);
+        if (bodyLength > 0)
+            this.byteBuf.writeBytes(msgInner.getBody());
+
+        // 16 TOPIC
+        if (MessageVersion.MESSAGE_VERSION_V2.equals(msgInner.getVersion())) {
+            this.byteBuf.writeShort((short) topicLength);
+        } else {
+            this.byteBuf.writeByte((byte) topicLength);
+        }
+        this.byteBuf.writeBytes(topicData);
+
+        return null;
     }
 
     public PutMessageResult encode(MessageExtBrokerInner msgInner) {
         this.byteBuf.clear();
+
+        if (messageStoreConfig.isEnableMultiDispatch() && CommitLog.isMultiDispatchMsg(msgInner)) {
+            return encodeWithoutProperties(msgInner);
+        }
+
         /**
          * Serialize message
          */
         final byte[] propertiesData =
             msgInner.getPropertiesString() == null ? null : msgInner.getPropertiesString().getBytes(MessageDecoder.CHARSET_UTF8);
 
-        final int propertiesLength = propertiesData == null ? 0 : propertiesData.length;
+        boolean needAppendLastPropertySeparator = crc32ReservedLength > 0 && propertiesData != null && propertiesData.length > 0
+            && propertiesData[propertiesData.length - 1] != MessageDecoder.PROPERTY_SEPARATOR;
+
+        final int propertiesLength = (propertiesData == null ? 0 : propertiesData.length) + (needAppendLastPropertySeparator ? 1 : 0) + crc32ReservedLength;
 
         if (propertiesLength > Short.MAX_VALUE) {
-            log.warn("putMessage message properties length too long. length={}", propertiesData.length);
+            log.warn("putMessage message properties length too long. length={}", propertiesLength);
             return new PutMessageResult(PutMessageStatus.PROPERTIES_SIZE_EXCEEDED, null);
         }
 
@@ -89,8 +199,8 @@ public class MessageExtEncoder {
         final int topicLength = topicData.length;
 
         final int bodyLength = msgInner.getBody() == null ? 0 : msgInner.getBody().length;
-
-        final int msgLen = calMsgLength(msgInner.getSysFlag(), bodyLength, topicLength, propertiesLength);
+        final int msgLen = calMsgLength(
+            msgInner.getVersion(), msgInner.getSysFlag(), bodyLength, topicLength, propertiesLength);
 
         // Exceeds the maximum message body
         if (bodyLength > this.maxMessageBodySize) {
@@ -111,7 +221,7 @@ public class MessageExtEncoder {
         // 1 TOTALSIZE
         this.byteBuf.writeInt(msgLen);
         // 2 MAGICCODE
-        this.byteBuf.writeInt(CommitLog.MESSAGE_MAGIC_CODE);
+        this.byteBuf.writeInt(msgInner.getVersion().getMagicCode());
         // 3 BODYCRC
         this.byteBuf.writeInt(msgInner.getBodyCRC());
         // 4 QUEUEID
@@ -146,13 +256,25 @@ public class MessageExtEncoder {
         this.byteBuf.writeInt(bodyLength);
         if (bodyLength > 0)
             this.byteBuf.writeBytes(msgInner.getBody());
+
         // 16 TOPIC
-        this.byteBuf.writeByte((byte) topicLength);
+        if (MessageVersion.MESSAGE_VERSION_V2.equals(msgInner.getVersion())) {
+            this.byteBuf.writeShort((short) topicLength);
+        } else {
+            this.byteBuf.writeByte((byte) topicLength);
+        }
         this.byteBuf.writeBytes(topicData);
+
         // 17 PROPERTIES
         this.byteBuf.writeShort((short) propertiesLength);
-        if (propertiesLength > 0)
+        if (propertiesLength > crc32ReservedLength) {
             this.byteBuf.writeBytes(propertiesData);
+        }
+        if (needAppendLastPropertySeparator) {
+            this.byteBuf.writeByte((byte) MessageDecoder.PROPERTY_SEPARATOR);
+        }
+        // 18 CRC32
+        this.byteBuf.writerIndex(this.byteBuf.writerIndex() + crc32ReservedLength);
 
         return null;
     }
@@ -204,15 +326,18 @@ public class MessageExtEncoder {
             final byte[] topicData = messageExtBatch.getTopic().getBytes(MessageDecoder.CHARSET_UTF8);
 
             final int topicLength = topicData.length;
+            int totalPropLen = needAppendLastPropertySeparator ?
+                propertiesLen + batchPropLen + 1 : propertiesLen + batchPropLen;
 
-            int totalPropLen = needAppendLastPropertySeparator ? propertiesLen + batchPropLen + 1
-                : propertiesLen + batchPropLen;
-            final int msgLen = calMsgLength(messageExtBatch.getSysFlag(), bodyLen, topicLength, totalPropLen);
+            // properties need to add crc32
+            totalPropLen += crc32ReservedLength;
+            final int msgLen = calMsgLength(
+                messageExtBatch.getVersion(), messageExtBatch.getSysFlag(), bodyLen, topicLength, totalPropLen);
 
             // 1 TOTALSIZE
             this.byteBuf.writeInt(msgLen);
             // 2 MAGICCODE
-            this.byteBuf.writeInt(CommitLog.MESSAGE_MAGIC_CODE);
+            this.byteBuf.writeInt(messageExtBatch.getVersion().getMagicCode());
             // 3 BODYCRC
             this.byteBuf.writeInt(bodyCrc);
             // 4 QUEUEID
@@ -247,9 +372,15 @@ public class MessageExtEncoder {
             this.byteBuf.writeInt(bodyLen);
             if (bodyLen > 0)
                 this.byteBuf.writeBytes(messagesByteBuff.array(), bodyPos, bodyLen);
+
             // 16 TOPIC
-            this.byteBuf.writeByte((byte) topicLength);
+            if (MessageVersion.MESSAGE_VERSION_V2.equals(messageExtBatch.getVersion())) {
+                this.byteBuf.writeShort((short) topicLength);
+            } else {
+                this.byteBuf.writeByte((byte) topicLength);
+            }
             this.byteBuf.writeBytes(topicData);
+
             // 17 PROPERTIES
             this.byteBuf.writeShort((short) totalPropLen);
             if (propertiesLen > 0) {
@@ -261,6 +392,7 @@ public class MessageExtEncoder {
                 }
                 this.byteBuf.writeBytes(batchPropData, 0, batchPropLen);
             }
+            this.byteBuf.writerIndex(this.byteBuf.writerIndex() + crc32ReservedLength);
         }
         putMessageContext.setBatchSize(batchSize);
         putMessageContext.setPhyPos(new long[batchSize]);
@@ -269,7 +401,7 @@ public class MessageExtEncoder {
     }
 
     public ByteBuffer getEncoderBuffer() {
-        return this.byteBuf.nioBuffer();
+        return this.byteBuf.nioBuffer(0, this.byteBuf.capacity());
     }
 
     public int getMaxMessageBodySize() {
@@ -287,8 +419,9 @@ public class MessageExtEncoder {
     static class PutMessageThreadLocal {
         private final MessageExtEncoder encoder;
         private final StringBuilder keyBuilder;
-        PutMessageThreadLocal(int size) {
-            encoder = new MessageExtEncoder(size);
+
+        PutMessageThreadLocal(MessageStoreConfig messageStoreConfig) {
+            encoder = new MessageExtEncoder(messageStoreConfig);
             keyBuilder = new StringBuilder();
         }
 

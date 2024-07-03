@@ -101,11 +101,16 @@ public class ClientProcessor extends AbstractProcessor {
         this.serviceManager.getConsumerManager().unregisterConsumer(consumerGroup, clientChannelInfo, false);
     }
 
+    public void doChannelCloseEvent(String remoteAddr, Channel channel) {
+        this.serviceManager.getConsumerManager().doChannelCloseEvent(remoteAddr, channel);
+        this.serviceManager.getProducerManager().doChannelCloseEvent(remoteAddr, channel);
+    }
+
     public void registerConsumerIdsChangeListener(ConsumerIdsChangeListener listener) {
         this.serviceManager.getConsumerManager().appendConsumerIdsChangeListener(listener);
     }
 
-    public ConsumerGroupInfo getConsumerGroupInfo(String consumerGroup) {
+    public ConsumerGroupInfo getConsumerGroupInfo(ProxyContext ctx, String consumerGroup) {
         return this.serviceManager.getConsumerManager().getConsumerGroupInfo(consumerGroup);
     }
 }

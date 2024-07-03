@@ -29,15 +29,18 @@ import org.apache.commons.cli.DefaultParser;
 import org.apache.commons.cli.Option;
 import org.apache.commons.cli.Options;
 import org.apache.commons.lang3.StringUtils;
+import org.apache.rocketmq.acl.AccessValidator;
+import org.apache.rocketmq.acl.plain.PlainAccessValidator;
 import org.apache.rocketmq.broker.BrokerController;
 import org.apache.rocketmq.broker.BrokerStartup;
 import org.apache.rocketmq.common.MixAll;
 import org.apache.rocketmq.common.constant.LoggerName;
 import org.apache.rocketmq.common.thread.ThreadPoolMonitor;
+import org.apache.rocketmq.common.utils.ServiceProvider;
 import org.apache.rocketmq.logging.org.slf4j.Logger;
 import org.apache.rocketmq.logging.org.slf4j.LoggerFactory;
-import org.apache.rocketmq.proxy.common.AbstractStartAndShutdown;
-import org.apache.rocketmq.proxy.common.StartAndShutdown;
+import org.apache.rocketmq.common.utils.AbstractStartAndShutdown;
+import org.apache.rocketmq.common.utils.StartAndShutdown;
 import org.apache.rocketmq.proxy.config.Configuration;
 import org.apache.rocketmq.proxy.config.ConfigurationManager;
 import org.apache.rocketmq.proxy.config.ProxyConfig;
@@ -47,6 +50,7 @@ import org.apache.rocketmq.proxy.grpc.v2.GrpcMessagingApplication;
 import org.apache.rocketmq.proxy.metrics.ProxyMetricsManager;
 import org.apache.rocketmq.proxy.processor.DefaultMessagingProcessor;
 import org.apache.rocketmq.proxy.processor.MessagingProcessor;
+import org.apache.rocketmq.proxy.remoting.RemotingProtocolServer;
 import org.apache.rocketmq.remoting.protocol.RemotingCommand;
 import org.apache.rocketmq.srvutil.ServerUtil;
 
@@ -74,14 +78,19 @@ public class ProxyStartup {
 
             MessagingProcessor messagingProcessor = createMessagingProcessor();
 
+            List<AccessValidator> accessValidators = loadAccessValidators();
             // create grpcServer
             GrpcServer grpcServer = GrpcServerBuilder.newBuilder(executor, ConfigurationManager.getProxyConfig().getGrpcServerPort())
                 .addService(createServiceProcessor(messagingProcessor))
                 .addService(ChannelzService.newInstance(100))
                 .addService(ProtoReflectionService.newInstance())
-                .configInterceptor()
+                .configInterceptor(accessValidators)
+                .shutdownTime(ConfigurationManager.getProxyConfig().getGrpcShutdownTimeSeconds(), TimeUnit.SECONDS)
                 .build();
             PROXY_START_AND_SHUTDOWN.appendStartAndShutdown(grpcServer);
+
+            RemotingProtocolServer remotingServer = new RemotingProtocolServer(messagingProcessor, accessValidators);
+            PROXY_START_AND_SHUTDOWN.appendStartAndShutdown(remotingServer);
 
             // start servers one by one.
             PROXY_START_AND_SHUTDOWN.start();
@@ -96,7 +105,6 @@ public class ProxyStartup {
                 }
             }));
         } catch (Exception e) {
-            System.err.println("find an unexpect err." + e);
             e.printStackTrace();
             log.error("find an unexpect err.", e);
             System.exit(1);
@@ -106,6 +114,15 @@ public class ProxyStartup {
         log.info(new Date() + " rocketmq-proxy startup successfully");
     }
 
+    protected static List<AccessValidator> loadAccessValidators() {
+        List<AccessValidator> accessValidators = ServiceProvider.load(AccessValidator.class);
+        if (accessValidators.isEmpty()) {
+            log.info("ServiceProvider loaded no AccessValidator, using default org.apache.rocketmq.acl.plain.PlainAccessValidator");
+            accessValidators.add(new PlainAccessValidator());
+        }
+        return accessValidators;
+    }
+
     protected static void initConfiguration(CommandLineArgument commandLineArgument) throws Exception {
         if (StringUtils.isNotBlank(commandLineArgument.getProxyConfigPath())) {
             System.setProperty(Configuration.CONFIG_PATH_PROPERTY, commandLineArgument.getProxyConfigPath());
@@ -113,6 +130,8 @@ public class ProxyStartup {
         ConfigurationManager.initEnv();
         ConfigurationManager.intConfig();
         setConfigFromCommandLineArgument(commandLineArgument);
+        log.info("Current configuration: " + ConfigurationManager.formatProxyConfig());
+
     }
 
     protected static CommandLineArgument parseCommandLineArgument(String[] args) {

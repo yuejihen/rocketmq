@@ -91,6 +91,14 @@ public interface MessageService {
         long timeoutMillis
     );
 
+    CompletableFuture<AckResult> batchAckMessage(
+        ProxyContext ctx,
+        List<ReceiptHandleMessage> handleList,
+        String consumerGroup,
+        String topic,
+        long timeoutMillis
+    );
+
     CompletableFuture<PullResult> pullMessage(
         ProxyContext ctx,
         AddressableMessageQueue messageQueue,
@@ -139,4 +147,10 @@ public interface MessageService {
         GetMinOffsetRequestHeader requestHeader,
         long timeoutMillis
     );
+
+    CompletableFuture<RemotingCommand> request(ProxyContext ctx, String brokerName, RemotingCommand request,
+        long timeoutMillis);
+
+    CompletableFuture<Void> requestOneway(ProxyContext ctx, String brokerName, RemotingCommand request,
+        long timeoutMillis);
 }

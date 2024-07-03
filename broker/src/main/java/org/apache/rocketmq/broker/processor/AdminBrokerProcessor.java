@@ -18,12 +18,14 @@ package org.apache.rocketmq.broker.processor;
 
 import com.alibaba.fastjson.JSON;
 import com.alibaba.fastjson.JSONObject;
+import com.google.common.collect.Sets;
 import io.netty.channel.Channel;
 import io.netty.channel.ChannelHandlerContext;
 import java.io.UnsupportedEncodingException;
 import java.net.UnknownHostException;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Iterator;
@@ -48,8 +50,8 @@ import org.apache.rocketmq.broker.filter.ExpressionMessageFilter;
 import org.apache.rocketmq.broker.plugin.BrokerAttachedPlugin;
 import org.apache.rocketmq.broker.subscription.SubscriptionGroupManager;
 import org.apache.rocketmq.broker.transaction.queue.TransactionalMessageUtil;
-import org.apache.rocketmq.common.AclConfig;
 import org.apache.rocketmq.common.BrokerConfig;
+import org.apache.rocketmq.common.KeyBuilder;
 import org.apache.rocketmq.common.LockCallback;
 import org.apache.rocketmq.common.MQVersion;
 import org.apache.rocketmq.common.MixAll;
@@ -58,7 +60,9 @@ import org.apache.rocketmq.common.TopicConfig;
 import org.apache.rocketmq.common.UnlockCallback;
 import org.apache.rocketmq.common.UtilAll;
 import org.apache.rocketmq.common.attribute.AttributeParser;
+import org.apache.rocketmq.common.attribute.TopicMessageType;
 import org.apache.rocketmq.common.constant.ConsumeInitMode;
+import org.apache.rocketmq.common.constant.FIleReadaheadMode;
 import org.apache.rocketmq.common.constant.LoggerName;
 import org.apache.rocketmq.common.constant.PermName;
 import org.apache.rocketmq.common.message.MessageAccessor;
@@ -110,6 +114,7 @@ import org.apache.rocketmq.remoting.protocol.body.QueryCorrectionOffsetBody;
 import org.apache.rocketmq.remoting.protocol.body.QuerySubscriptionResponseBody;
 import org.apache.rocketmq.remoting.protocol.body.QueueTimeSpan;
 import org.apache.rocketmq.remoting.protocol.body.ResetOffsetBody;
+import org.apache.rocketmq.remoting.protocol.body.SyncStateSet;
 import org.apache.rocketmq.remoting.protocol.body.TopicConfigAndMappingSerializeWrapper;
 import org.apache.rocketmq.remoting.protocol.body.TopicList;
 import org.apache.rocketmq.remoting.protocol.body.UnlockBatchRequestBody;
@@ -125,8 +130,6 @@ import org.apache.rocketmq.remoting.protocol.header.ExchangeHAInfoResponseHeader
 import org.apache.rocketmq.remoting.protocol.header.GetAllProducerInfoRequestHeader;
 import org.apache.rocketmq.remoting.protocol.header.GetAllTopicConfigResponseHeader;
 import org.apache.rocketmq.remoting.protocol.header.GetBrokerAclConfigResponseHeader;
-import org.apache.rocketmq.remoting.protocol.header.GetBrokerClusterAclConfigResponseBody;
-import org.apache.rocketmq.remoting.protocol.header.GetBrokerClusterAclConfigResponseHeader;
 import org.apache.rocketmq.remoting.protocol.header.GetBrokerConfigResponseHeader;
 import org.apache.rocketmq.remoting.protocol.header.GetConsumeStatsInBrokerHeader;
 import org.apache.rocketmq.remoting.protocol.header.GetConsumeStatsRequestHeader;
@@ -159,8 +162,6 @@ import org.apache.rocketmq.remoting.protocol.header.SearchOffsetResponseHeader;
 import org.apache.rocketmq.remoting.protocol.header.UpdateGlobalWhiteAddrsConfigRequestHeader;
 import org.apache.rocketmq.remoting.protocol.header.UpdateGroupForbiddenRequestHeader;
 import org.apache.rocketmq.remoting.protocol.header.ViewBrokerStatsDataRequestHeader;
-import org.apache.rocketmq.remoting.protocol.header.filtersrv.RegisterFilterServerRequestHeader;
-import org.apache.rocketmq.remoting.protocol.header.filtersrv.RegisterFilterServerResponseHeader;
 import org.apache.rocketmq.remoting.protocol.heartbeat.SubscriptionData;
 import org.apache.rocketmq.remoting.protocol.statictopic.LogicQueueMappingItem;
 import org.apache.rocketmq.remoting.protocol.statictopic.TopicConfigAndQueueMapping;
@@ -174,6 +175,7 @@ import org.apache.rocketmq.remoting.rpc.RpcException;
 import org.apache.rocketmq.remoting.rpc.RpcRequest;
 import org.apache.rocketmq.remoting.rpc.RpcResponse;
 import org.apache.rocketmq.store.ConsumeQueueExt;
+import org.apache.rocketmq.store.DefaultMessageStore;
 import org.apache.rocketmq.store.MessageFilter;
 import org.apache.rocketmq.store.MessageStore;
 import org.apache.rocketmq.store.PutMessageResult;
@@ -185,15 +187,26 @@ import org.apache.rocketmq.store.queue.CqUnit;
 import org.apache.rocketmq.store.queue.ReferredIterator;
 import org.apache.rocketmq.store.timer.TimerCheckpoint;
 import org.apache.rocketmq.store.timer.TimerMessageStore;
+import org.apache.rocketmq.store.util.LibC;
 
 import static org.apache.rocketmq.remoting.protocol.RemotingCommand.buildErrorResponse;
 
 public class AdminBrokerProcessor implements NettyRequestProcessor {
     private static final Logger LOGGER = LoggerFactory.getLogger(LoggerName.BROKER_LOGGER_NAME);
     protected final BrokerController brokerController;
+    protected Set<String> configBlackList = new HashSet<>();
 
     public AdminBrokerProcessor(final BrokerController brokerController) {
         this.brokerController = brokerController;
+        initConfigBlackList();
+    }
+
+    private void initConfigBlackList() {
+        configBlackList.add("brokerConfigPath");
+        configBlackList.add("rocketmqHome");
+        configBlackList.add("configBlackList");
+        String[] configArray = brokerController.getBrokerConfig().getConfigBlackList().split(";");
+        configBlackList.addAll(Arrays.asList(configArray));
     }
 
     @Override
@@ -214,6 +227,14 @@ public class AdminBrokerProcessor implements NettyRequestProcessor {
                 return this.updateBrokerConfig(ctx, request);
             case RequestCode.GET_BROKER_CONFIG:
                 return this.getBrokerConfig(ctx, request);
+            case RequestCode.UPDATE_COLD_DATA_FLOW_CTR_CONFIG:
+                return this.updateColdDataFlowCtrGroupConfig(ctx, request);
+            case RequestCode.REMOVE_COLD_DATA_FLOW_CTR_CONFIG:
+                return this.removeColdDataFlowCtrGroupConfig(ctx, request);
+            case RequestCode.GET_COLD_DATA_FLOW_CTR_INFO:
+                return this.getColdDataFlowCtrInfo(ctx);
+            case RequestCode.SET_COMMITLOG_READ_MODE:
+                return this.setCommitLogReadaheadMode(ctx, request);
             case RequestCode.SEARCH_OFFSET_BY_TIMESTAMP:
                 return this.searchOffsetByTimestamp(ctx, request);
             case RequestCode.GET_MAX_OFFSET:
@@ -260,8 +281,6 @@ public class AdminBrokerProcessor implements NettyRequestProcessor {
                 return this.queryTopicsByConsumer(ctx, request);
             case RequestCode.QUERY_SUBSCRIPTION_BY_CONSUMER:
                 return this.querySubscriptionByConsumer(ctx, request);
-            case RequestCode.REGISTER_FILTER_SERVER:
-                return this.registerFilterServer(ctx, request);
             case RequestCode.QUERY_CONSUME_TIME_SPAN:
                 return this.queryConsumeTimeSpan(ctx, request);
             case RequestCode.GET_SYSTEM_TOPIC_LIST_FROM_BROKER:
@@ -300,8 +319,6 @@ public class AdminBrokerProcessor implements NettyRequestProcessor {
                 return updateGlobalWhiteAddrsConfig(ctx, request);
             case RequestCode.RESUME_CHECK_HALF_MESSAGE:
                 return resumeCheckHalfMessage(ctx, request);
-            case RequestCode.GET_BROKER_CLUSTER_ACL_CONFIG:
-                return getBrokerClusterAclConfig(ctx, request);
             case RequestCode.GET_TOPIC_CONFIG:
                 return getTopicConfig(ctx, request);
             case RequestCode.UPDATE_AND_CREATE_STATIC_TOPIC:
@@ -395,9 +412,6 @@ public class AdminBrokerProcessor implements NettyRequestProcessor {
     private synchronized RemotingCommand updateAndCreateTopic(ChannelHandlerContext ctx,
         RemotingCommand request) throws RemotingCommandException {
         final RemotingCommand response = RemotingCommand.createResponseCommand(null);
-        if (validateSlave(response)) {
-            return response;
-        }
         final CreateTopicRequestHeader requestHeader =
             (CreateTopicRequestHeader) request.decodeCommandCustomHeader(CreateTopicRequestHeader.class);
 
@@ -426,18 +440,38 @@ public class AdminBrokerProcessor implements NettyRequestProcessor {
         topicConfig.setTopicFilterType(requestHeader.getTopicFilterTypeEnum());
         topicConfig.setPerm(requestHeader.getPerm());
         topicConfig.setTopicSysFlag(requestHeader.getTopicSysFlag() == null ? 0 : requestHeader.getTopicSysFlag());
+        topicConfig.setOrder(requestHeader.getOrder());
         String attributesModification = requestHeader.getAttributes();
         topicConfig.setAttributes(AttributeParser.parseToMap(attributesModification));
 
+        if (topicConfig.getTopicMessageType() == TopicMessageType.MIXED
+            && !brokerController.getBrokerConfig().isEnableMixedMessageType()) {
+            response.setCode(ResponseCode.SYSTEM_ERROR);
+            response.setRemark("MIXED message type is not supported.");
+            return response;
+        }
+
+        if (topicConfig.equals(this.brokerController.getTopicConfigManager().getTopicConfigTable().get(topic))) {
+            LOGGER.info("Broker receive request to update or create topic={}, but topicConfig has  no changes , so idempotent, caller address={}",
+                requestHeader.getTopic(), RemotingHelper.parseChannelRemoteAddr(ctx.channel()));
+            response.setCode(ResponseCode.SUCCESS);
+            return response;
+        }
+
         try {
             this.brokerController.getTopicConfigManager().updateTopicConfig(topicConfig);
-            this.brokerController.registerIncrementBrokerData(topicConfig, this.brokerController.getTopicConfigManager().getDataVersion());
+            if (brokerController.getBrokerConfig().isEnableSingleTopicRegister()) {
+                this.brokerController.registerSingleTopicAll(topicConfig);
+            } else {
+                this.brokerController.registerIncrementBrokerData(topicConfig, this.brokerController.getTopicConfigManager().getDataVersion());
+            }
             response.setCode(ResponseCode.SUCCESS);
         } catch (Exception e) {
             LOGGER.error("Update / create topic failed for [{}]", request, e);
             response.setCode(ResponseCode.SYSTEM_ERROR);
             response.setRemark(e.getMessage());
         }
+
         return response;
     }
 
@@ -495,9 +529,6 @@ public class AdminBrokerProcessor implements NettyRequestProcessor {
     private synchronized RemotingCommand deleteTopic(ChannelHandlerContext ctx,
         RemotingCommand request) throws RemotingCommandException {
         final RemotingCommand response = RemotingCommand.createResponseCommand(null);
-        if (validateSlave(response)) {
-            return response;
-        }
         DeleteTopicRequestHeader requestHeader =
             (DeleteTopicRequestHeader) request.decodeCommandCustomHeader(DeleteTopicRequestHeader.class);
 
@@ -505,12 +536,13 @@ public class AdminBrokerProcessor implements NettyRequestProcessor {
             requestHeader.getTopic(), RemotingHelper.parseChannelRemoteAddr(ctx.channel()));
 
         String topic = requestHeader.getTopic();
-        TopicValidator.ValidateTopicResult result = TopicValidator.validateTopic(topic);
-        if (!result.isValid()) {
+
+        if (UtilAll.isBlank(topic)) {
             response.setCode(ResponseCode.SYSTEM_ERROR);
-            response.setRemark(result.getRemark());
+            response.setRemark("The specified topic is blank.");
             return response;
         }
+
         if (brokerController.getBrokerConfig().isValidateSystemTopicWhenUpdateTopic()) {
             if (TopicValidator.isSystemTopic(topic)) {
                 response.setCode(ResponseCode.SYSTEM_ERROR);
@@ -519,18 +551,35 @@ public class AdminBrokerProcessor implements NettyRequestProcessor {
             }
         }
 
-        this.brokerController.getTopicConfigManager().deleteTopicConfig(requestHeader.getTopic());
-        this.brokerController.getTopicQueueMappingManager().delete(requestHeader.getTopic());
-        this.brokerController.getConsumerOffsetManager().cleanOffsetByTopic(requestHeader.getTopic());
-        this.brokerController.getMessageStore()
-            .cleanUnusedTopic(this.brokerController.getTopicConfigManager().getTopicConfigTable().keySet());
-        if (this.brokerController.getBrokerConfig().isAutoDeleteUnusedStats()) {
-            this.brokerController.getBrokerStatsManager().onTopicDeleted(requestHeader.getTopic());
+        final Set<String> groups = this.brokerController.getConsumerOffsetManager().whichGroupByTopic(topic);
+        // delete pop retry topics first
+        try {
+            for (String group : groups) {
+                final String popRetryTopicV2 = KeyBuilder.buildPopRetryTopic(topic, group, true);
+                if (brokerController.getTopicConfigManager().selectTopicConfig(popRetryTopicV2) != null) {
+                    deleteTopicInBroker(popRetryTopicV2);
+                }
+                final String popRetryTopicV1 = KeyBuilder.buildPopRetryTopicV1(topic, group);
+                if (brokerController.getTopicConfigManager().selectTopicConfig(popRetryTopicV1) != null) {
+                    deleteTopicInBroker(popRetryTopicV1);
+                }
+            }
+            // delete topic
+            deleteTopicInBroker(topic);
+        } catch (Throwable t) {
+            return buildErrorResponse(ResponseCode.SYSTEM_ERROR, t.getMessage());
         }
-
         response.setCode(ResponseCode.SUCCESS);
         response.setRemark(null);
         return response;
+    }
+
+    private void deleteTopicInBroker(String topic) {
+        this.brokerController.getTopicConfigManager().deleteTopicConfig(topic);
+        this.brokerController.getTopicQueueMappingManager().delete(topic);
+        this.brokerController.getConsumerOffsetManager().cleanOffsetByTopic(topic);
+        this.brokerController.getPopInflightMessageCounter().clearInFlightMessageNumByTopicName(topic);
+        this.brokerController.getMessageStore().deleteTopics(Sets.newHashSet(topic));
     }
 
     private synchronized RemotingCommand updateAndCreateAccessConfig(ChannelHandlerContext ctx,
@@ -559,14 +608,14 @@ public class AdminBrokerProcessor implements NettyRequestProcessor {
                 response.setRemark(null);
                 NettyRemotingAbstract.writeResponse(ctx.channel(), request, response);
             } else {
-                String errorMsg = "The accesskey[" + requestHeader.getAccessKey() + "] corresponding to accessConfig has been updated failed.";
+                String errorMsg = "The accessKey[" + requestHeader.getAccessKey() + "] corresponding to accessConfig has been updated failed.";
                 LOGGER.warn(errorMsg);
                 response.setCode(ResponseCode.UPDATE_AND_CREATE_ACL_CONFIG_FAILED);
                 response.setRemark(errorMsg);
                 return response;
             }
         } catch (Exception e) {
-            LOGGER.error("Failed to generate a proper update accessvalidator response", e);
+            LOGGER.error("Failed to generate a proper update accessValidator response", e);
             response.setCode(ResponseCode.UPDATE_AND_CREATE_ACL_CONFIG_FAILED);
             response.setRemark(e.getMessage());
             return response;
@@ -593,7 +642,7 @@ public class AdminBrokerProcessor implements NettyRequestProcessor {
                 response.setRemark(null);
                 NettyRemotingAbstract.writeResponse(ctx.channel(), request, response);
             } else {
-                String errorMsg = "The accesskey[" + requestHeader.getAccessKey() + "] corresponding to accessConfig has been deleted failed.";
+                String errorMsg = "The accessKey[" + requestHeader.getAccessKey() + "] corresponding to accessConfig has been deleted failed.";
                 LOGGER.warn(errorMsg);
                 response.setCode(ResponseCode.DELETE_ACL_CONFIG_FAILED);
                 response.setRemark(errorMsg);
@@ -601,7 +650,7 @@ public class AdminBrokerProcessor implements NettyRequestProcessor {
             }
 
         } catch (Exception e) {
-            LOGGER.error("Failed to generate a proper delete accessvalidator response", e);
+            LOGGER.error("Failed to generate a proper delete accessValidator response", e);
             response.setCode(ResponseCode.DELETE_ACL_CONFIG_FAILED);
             response.setRemark(e.getMessage());
             return response;
@@ -663,27 +712,6 @@ public class AdminBrokerProcessor implements NettyRequestProcessor {
             return response;
         } catch (Exception e) {
             LOGGER.error("Failed to generate a proper getBrokerAclConfigVersion response", e);
-        }
-
-        return null;
-    }
-
-    private RemotingCommand getBrokerClusterAclConfig(ChannelHandlerContext ctx, RemotingCommand request) {
-
-        final RemotingCommand response = RemotingCommand.createResponseCommand(GetBrokerClusterAclConfigResponseHeader.class);
-
-        try {
-            AccessValidator accessValidator = this.brokerController.getAccessValidatorMap().get(PlainAccessValidator.class);
-            GetBrokerClusterAclConfigResponseBody body = new GetBrokerClusterAclConfigResponseBody();
-            AclConfig aclConfig = accessValidator.getAllAclConfig();
-            body.setGlobalWhiteAddrs(aclConfig.getGlobalWhiteAddrs());
-            body.setPlainAccessConfigs(aclConfig.getPlainAccessConfigs());
-            response.setCode(ResponseCode.SUCCESS);
-            response.setBody(body.encode());
-            response.setRemark(null);
-            return response;
-        } catch (Exception e) {
-            LOGGER.error("Failed to generate a proper getBrokerClusterAclConfig response", e);
         }
 
         return null;
@@ -763,6 +791,132 @@ public class AdminBrokerProcessor implements NettyRequestProcessor {
         return response;
     }
 
+    private synchronized RemotingCommand updateColdDataFlowCtrGroupConfig(ChannelHandlerContext ctx,
+        RemotingCommand request) {
+        final RemotingCommand response = RemotingCommand.createResponseCommand(null);
+        LOGGER.info("updateColdDataFlowCtrGroupConfig called by {}", RemotingHelper.parseChannelRemoteAddr(ctx.channel()));
+
+        byte[] body = request.getBody();
+        if (body != null) {
+            try {
+                String bodyStr = new String(body, MixAll.DEFAULT_CHARSET);
+                Properties properties = MixAll.string2Properties(bodyStr);
+                if (properties != null) {
+                    LOGGER.info("updateColdDataFlowCtrGroupConfig new config: {}, client: {}", properties, ctx.channel().remoteAddress());
+                    properties.entrySet().stream().forEach(i -> {
+                        try {
+                            String consumerGroup = String.valueOf(i.getKey());
+                            Long threshold = Long.valueOf(String.valueOf(i.getValue()));
+                            this.brokerController.getColdDataCgCtrService().addOrUpdateGroupConfig(consumerGroup, threshold);
+                        } catch (Exception e) {
+                            LOGGER.error("updateColdDataFlowCtrGroupConfig properties on entry error, key: {}, val: {}", i.getKey(), i.getValue(), e);
+                        }
+                    });
+                } else {
+                    LOGGER.error("updateColdDataFlowCtrGroupConfig string2Properties error");
+                    response.setCode(ResponseCode.SYSTEM_ERROR);
+                    response.setRemark("string2Properties error");
+                    return response;
+                }
+            } catch (UnsupportedEncodingException e) {
+                LOGGER.error("updateColdDataFlowCtrGroupConfig UnsupportedEncodingException", e);
+                response.setCode(ResponseCode.SYSTEM_ERROR);
+                response.setRemark("UnsupportedEncodingException " + e);
+                return response;
+            }
+        }
+        response.setCode(ResponseCode.SUCCESS);
+        response.setRemark(null);
+        return response;
+    }
+
+    private synchronized RemotingCommand removeColdDataFlowCtrGroupConfig(ChannelHandlerContext ctx,
+        RemotingCommand request) {
+        final RemotingCommand response = RemotingCommand.createResponseCommand(null);
+        LOGGER.info("removeColdDataFlowCtrGroupConfig called by {}", RemotingHelper.parseChannelRemoteAddr(ctx.channel()));
+
+        byte[] body = request.getBody();
+        if (body != null) {
+            try {
+                String consumerGroup = new String(body, MixAll.DEFAULT_CHARSET);
+                if (consumerGroup != null) {
+                    LOGGER.info("removeColdDataFlowCtrGroupConfig, consumerGroup: {} client: {}", consumerGroup, ctx.channel().remoteAddress());
+                    this.brokerController.getColdDataCgCtrService().removeGroupConfig(consumerGroup);
+                } else {
+                    LOGGER.error("removeColdDataFlowCtrGroupConfig string parse error");
+                    response.setCode(ResponseCode.SYSTEM_ERROR);
+                    response.setRemark("string parse error");
+                    return response;
+                }
+            } catch (UnsupportedEncodingException e) {
+                LOGGER.error("removeColdDataFlowCtrGroupConfig UnsupportedEncodingException", e);
+                response.setCode(ResponseCode.SYSTEM_ERROR);
+                response.setRemark("UnsupportedEncodingException " + e);
+                return response;
+            }
+        }
+        response.setCode(ResponseCode.SUCCESS);
+        response.setRemark(null);
+        return response;
+    }
+
+    private RemotingCommand getColdDataFlowCtrInfo(ChannelHandlerContext ctx) {
+        final RemotingCommand response = RemotingCommand.createResponseCommand(null);
+        LOGGER.info("getColdDataFlowCtrInfo called by {}", RemotingHelper.parseChannelRemoteAddr(ctx.channel()));
+
+        String content = this.brokerController.getColdDataCgCtrService().getColdDataFlowCtrInfo();
+        if (content != null) {
+            try {
+                response.setBody(content.getBytes(MixAll.DEFAULT_CHARSET));
+            } catch (UnsupportedEncodingException e) {
+                LOGGER.error("getColdDataFlowCtrInfo UnsupportedEncodingException", e);
+                response.setCode(ResponseCode.SYSTEM_ERROR);
+                response.setRemark("UnsupportedEncodingException " + e);
+                return response;
+            }
+        }
+        response.setCode(ResponseCode.SUCCESS);
+        response.setRemark(null);
+        return response;
+    }
+
+    private RemotingCommand setCommitLogReadaheadMode(ChannelHandlerContext ctx, RemotingCommand request) {
+        final RemotingCommand response = RemotingCommand.createResponseCommand(null);
+        LOGGER.info("setCommitLogReadaheadMode called by {}", RemotingHelper.parseChannelRemoteAddr(ctx.channel()));
+
+        try {
+            HashMap<String, String> extFields = request.getExtFields();
+            if (null == extFields) {
+                response.setCode(ResponseCode.SYSTEM_ERROR);
+                response.setRemark("set commitlog readahead mode param error");
+                return response;
+            }
+            int mode = Integer.parseInt(extFields.get(FIleReadaheadMode.READ_AHEAD_MODE));
+            if (mode != LibC.MADV_RANDOM && mode != LibC.MADV_NORMAL) {
+                response.setCode(ResponseCode.SYSTEM_ERROR);
+                response.setRemark("set commitlog readahead mode param value error");
+                return response;
+            }
+            MessageStore messageStore = this.brokerController.getMessageStore();
+            if (messageStore instanceof DefaultMessageStore) {
+                DefaultMessageStore defaultMessageStore = (DefaultMessageStore) messageStore;
+                if (mode == LibC.MADV_NORMAL) {
+                    defaultMessageStore.getMessageStoreConfig().setDataReadAheadEnable(true);
+                } else {
+                    defaultMessageStore.getMessageStoreConfig().setDataReadAheadEnable(false);
+                }
+                defaultMessageStore.getCommitLog().scanFileAndSetReadMode(mode);
+            }
+            response.setCode(ResponseCode.SUCCESS);
+            response.setRemark("set commitlog readahead mode success, mode: " + mode);
+        } catch (Exception e) {
+            LOGGER.error("set commitlog readahead mode failed", e);
+            response.setCode(ResponseCode.SYSTEM_ERROR);
+            response.setRemark("set commitlog readahead mode failed");
+        }
+        return response;
+    }
+
     private synchronized RemotingCommand updateBrokerConfig(ChannelHandlerContext ctx, RemotingCommand request) {
         final RemotingCommand response = RemotingCommand.createResponseCommand(null);
 
@@ -775,12 +929,20 @@ public class AdminBrokerProcessor implements NettyRequestProcessor {
                 String bodyStr = new String(body, MixAll.DEFAULT_CHARSET);
                 Properties properties = MixAll.string2Properties(bodyStr);
                 if (properties != null) {
-                    LOGGER.info("updateBrokerConfig, new config: [{}] client: {} ", properties, ctx.channel().remoteAddress());
+                    LOGGER.info("updateBrokerConfig, new config: [{}] client: {} ", properties, callerAddress);
+                    if (validateBlackListConfigExist(properties)) {
+                        response.setCode(ResponseCode.NO_PERMISSION);
+                        response.setRemark("Can not update config in black list.");
+                        return response;
+                    }
+
                     this.brokerController.getConfiguration().update(properties);
                     if (properties.containsKey("brokerPermission")) {
-                        this.brokerController.getTopicConfigManager().getDataVersion().nextVersion();
+                        long stateMachineVersion = brokerController.getMessageStore() != null ? brokerController.getMessageStore().getStateMachineVersion() : 0;
+                        this.brokerController.getTopicConfigManager().getDataVersion().nextVersion(stateMachineVersion);
                         this.brokerController.registerBrokerAll(false, false, true);
                     }
+
                 } else {
                     LOGGER.error("string2Properties error");
                     response.setCode(ResponseCode.SYSTEM_ERROR);
@@ -848,7 +1010,7 @@ public class AdminBrokerProcessor implements NettyRequestProcessor {
                     continue;
                 }
                 if (mappingDetail.getBname().equals(item.getBname())) {
-                    offset = this.brokerController.getMessageStore().getOffsetInQueueByTime(mappingContext.getTopic(), item.getQueueId(), timestamp);
+                    offset = this.brokerController.getMessageStore().getOffsetInQueueByTime(mappingContext.getTopic(), item.getQueueId(), timestamp, requestHeader.getBoundaryType());
                     if (offset > 0) {
                         offset = item.computeStaticQueueOffsetStrictly(offset);
                         break;
@@ -857,7 +1019,7 @@ public class AdminBrokerProcessor implements NettyRequestProcessor {
                     requestHeader.setLo(false);
                     requestHeader.setTimestamp(timestamp);
                     requestHeader.setQueueId(item.getQueueId());
-                    requestHeader.setBname(item.getBname());
+                    requestHeader.setBrokerName(item.getBname());
                     RpcRequest rpcRequest = new RpcRequest(RequestCode.SEARCH_OFFSET_BY_TIMESTAMP, requestHeader, null);
                     RpcResponse rpcResponse = this.brokerController.getBrokerOuterAPI().getRpcClient().invoke(rpcRequest, this.brokerController.getBrokerConfig().getForwardTimeout()).get();
                     if (rpcResponse.getException() != null) {
@@ -899,7 +1061,7 @@ public class AdminBrokerProcessor implements NettyRequestProcessor {
         }
 
         long offset = this.brokerController.getMessageStore().getOffsetInQueueByTime(requestHeader.getTopic(), requestHeader.getQueueId(),
-            requestHeader.getTimestamp());
+            requestHeader.getTimestamp(), requestHeader.getBoundaryType());
 
         responseHeader.setOffset(offset);
 
@@ -924,7 +1086,7 @@ public class AdminBrokerProcessor implements NettyRequestProcessor {
             LogicQueueMappingItem maxItem = TopicQueueMappingUtils.findLogicQueueMappingItem(mappingContext.getMappingItemList(), Long.MAX_VALUE, true);
             assert maxItem != null;
             assert maxItem.getLogicOffset() >= 0;
-            requestHeader.setBname(maxItem.getBname());
+            requestHeader.setBrokerName(maxItem.getBname());
             requestHeader.setLo(false);
             requestHeader.setQueueId(mappingItem.getQueueId());
 
@@ -990,7 +1152,7 @@ public class AdminBrokerProcessor implements NettyRequestProcessor {
         LogicQueueMappingItem mappingItem = TopicQueueMappingUtils.findLogicQueueMappingItem(mappingContext.getMappingItemList(), 0L, true);
         assert mappingItem != null;
         try {
-            requestHeader.setBname(mappingItem.getBname());
+            requestHeader.setBrokerName(mappingItem.getBname());
             requestHeader.setLo(false);
             requestHeader.setQueueId(mappingItem.getQueueId());
             long physicalOffset;
@@ -1057,7 +1219,7 @@ public class AdminBrokerProcessor implements NettyRequestProcessor {
         LogicQueueMappingItem mappingItem = TopicQueueMappingUtils.findLogicQueueMappingItem(mappingContext.getMappingItemList(), 0L, true);
         assert mappingItem != null;
         try {
-            requestHeader.setBname(mappingItem.getBname());
+            requestHeader.setBrokerName(mappingItem.getBname());
             requestHeader.setLo(false);
             RpcRequest rpcRequest = new RpcRequest(RequestCode.GET_EARLIEST_MSG_STORETIME, requestHeader, null);
             //TO DO check if it is in current broker
@@ -1245,9 +1407,6 @@ public class AdminBrokerProcessor implements NettyRequestProcessor {
     private RemotingCommand updateAndCreateSubscriptionGroup(ChannelHandlerContext ctx, RemotingCommand request)
         throws RemotingCommandException {
         final RemotingCommand response = RemotingCommand.createResponseCommand(null);
-        if (validateSlave(response)) {
-            return response;
-        }
 
         LOGGER.info("AdminBrokerProcessor#updateAndCreateSubscriptionGroup called by {}",
             RemotingHelper.parseChannelRemoteAddr(ctx.channel()));
@@ -1312,9 +1471,6 @@ public class AdminBrokerProcessor implements NettyRequestProcessor {
     private RemotingCommand deleteSubscriptionGroup(ChannelHandlerContext ctx,
         RemotingCommand request) throws RemotingCommandException {
         final RemotingCommand response = RemotingCommand.createResponseCommand(null);
-        if (validateSlave(response)) {
-            return response;
-        }
         DeleteSubscriptionGroupRequestHeader requestHeader =
             (DeleteSubscriptionGroupRequestHeader) request.decodeCommandCustomHeader(DeleteSubscriptionGroupRequestHeader.class);
 
@@ -1325,6 +1481,7 @@ public class AdminBrokerProcessor implements NettyRequestProcessor {
 
         if (requestHeader.isCleanOffset()) {
             this.brokerController.getConsumerOffsetManager().removeOffset(requestHeader.getGroupName());
+            this.brokerController.getPopInflightMessageCounter().clearInFlightMessageNumByGroupName(requestHeader.getGroupName());
         }
 
         if (this.brokerController.getBrokerConfig().isAutoDeleteUnusedStats()) {
@@ -1426,10 +1583,11 @@ public class AdminBrokerProcessor implements NettyRequestProcessor {
         return response;
     }
 
-    private RemotingCommand getAllProducerInfo(ChannelHandlerContext ctx, RemotingCommand request) throws RemotingCommandException {
+    private RemotingCommand getAllProducerInfo(ChannelHandlerContext ctx,
+        RemotingCommand request) throws RemotingCommandException {
         final RemotingCommand response = RemotingCommand.createResponseCommand(null);
         final GetAllProducerInfoRequestHeader requestHeader =
-                (GetAllProducerInfoRequestHeader) request.decodeCommandCustomHeader(GetAllProducerInfoRequestHeader.class);
+            (GetAllProducerInfoRequestHeader) request.decodeCommandCustomHeader(GetAllProducerInfoRequestHeader.class);
 
         ProducerTableInfo producerTable = this.brokerController.getProducerManager().getProducerTable();
         if (producerTable != null) {
@@ -1443,6 +1601,7 @@ public class AdminBrokerProcessor implements NettyRequestProcessor {
         response.setCode(ResponseCode.SYSTEM_ERROR);
         return response;
     }
+
     private RemotingCommand getProducerConnectionList(ChannelHandlerContext ctx,
         RemotingCommand request) throws RemotingCommandException {
         final RemotingCommand response = RemotingCommand.createResponseCommand(null);
@@ -1692,13 +1851,13 @@ public class AdminBrokerProcessor implements NettyRequestProcessor {
     /**
      * Reset consumer offset.
      *
-     * @param topic         Required, not null.
-     * @param group         Required, not null.
-     * @param queueId       if target queue ID is negative, all message queues will be reset;
-     *                      otherwise, only the target queue would get reset.
-     * @param timestamp     if timestamp is negative, offset would be reset to broker offset at the time being;
-     *                      otherwise, binary search is performed to locate target offset.
-     * @param offset        Target offset to reset to if target queue ID is properly provided.
+     * @param topic Required, not null.
+     * @param group Required, not null.
+     * @param queueId if target queue ID is negative, all message queues will be reset; otherwise, only the target queue
+     * would get reset.
+     * @param timestamp if timestamp is negative, offset would be reset to broker offset at the time being; otherwise,
+     * binary search is performed to locate target offset.
+     * @param offset Target offset to reset to if target queue ID is properly provided.
      * @return Affected queues and their new offset
      */
     private RemotingCommand resetOffsetInner(String topic, String group, int queueId, long timestamp, Long offset) {
@@ -1765,6 +1924,7 @@ public class AdminBrokerProcessor implements NettyRequestProcessor {
         ResetOffsetBody body = new ResetOffsetBody();
         String brokerName = brokerController.getBrokerConfig().getBrokerName();
         for (Map.Entry<Integer, Long> entry : queueOffsetMap.entrySet()) {
+            brokerController.getPopInflightMessageCounter().clearInFlightMessageNum(topic, group, entry.getKey());
             body.getOffsetTable().put(new MessageQueue(topic, brokerName, entry.getKey()), entry.getValue());
         }
 
@@ -1833,8 +1993,8 @@ public class AdminBrokerProcessor implements NettyRequestProcessor {
         QuerySubscriptionByConsumerRequestHeader requestHeader =
             (QuerySubscriptionByConsumerRequestHeader) request.decodeCommandCustomHeader(QuerySubscriptionByConsumerRequestHeader.class);
 
-        SubscriptionData subscriptionData =
-            this.brokerController.getConsumerManager().findSubscriptionData(requestHeader.getGroup(), requestHeader.getTopic());
+        SubscriptionData subscriptionData = this.brokerController.getConsumerManager()
+            .findSubscriptionData(requestHeader.getGroup(), requestHeader.getTopic());
 
         QuerySubscriptionResponseBody responseBody = new QuerySubscriptionResponseBody();
         responseBody.setGroup(requestHeader.getGroup());
@@ -1847,23 +2007,6 @@ public class AdminBrokerProcessor implements NettyRequestProcessor {
         response.setRemark(null);
         return response;
 
-    }
-
-    private RemotingCommand registerFilterServer(ChannelHandlerContext ctx,
-        RemotingCommand request) throws RemotingCommandException {
-        final RemotingCommand response = RemotingCommand.createResponseCommand(RegisterFilterServerResponseHeader.class);
-        final RegisterFilterServerResponseHeader responseHeader = (RegisterFilterServerResponseHeader) response.readCustomHeader();
-        final RegisterFilterServerRequestHeader requestHeader =
-            (RegisterFilterServerRequestHeader) request.decodeCommandCustomHeader(RegisterFilterServerRequestHeader.class);
-
-        this.brokerController.getFilterServerManager().registerFilterServer(ctx.channel(), requestHeader.getFilterServerAddr());
-
-        responseHeader.setBrokerId(this.brokerController.getBrokerConfig().getBrokerId());
-        responseHeader.setBrokerName(this.brokerController.getBrokerConfig().getBrokerName());
-
-        response.setCode(ResponseCode.SUCCESS);
-        response.setRemark(null);
-        return response;
     }
 
     private RemotingCommand queryConsumeTimeSpan(ChannelHandlerContext ctx,
@@ -1938,7 +2081,11 @@ public class AdminBrokerProcessor implements NettyRequestProcessor {
     public RemotingCommand cleanExpiredConsumeQueue() {
         LOGGER.info("AdminBrokerProcessor#cleanExpiredConsumeQueue: start.");
         final RemotingCommand response = RemotingCommand.createResponseCommand(null);
-        brokerController.getMessageStore().cleanExpiredConsumerQueue();
+        try {
+            brokerController.getMessageStore().cleanExpiredConsumerQueue();
+        } catch (Throwable t) {
+            return buildErrorResponse(ResponseCode.SYSTEM_ERROR, t.getMessage());
+        }
         LOGGER.info("AdminBrokerProcessor#cleanExpiredConsumeQueue: end.");
         response.setCode(ResponseCode.SUCCESS);
         response.setRemark(null);
@@ -2259,8 +2406,8 @@ public class AdminBrokerProcessor implements NettyRequestProcessor {
         runtimeInfo.put("startAcceptSendRequestTimeStamp", String.valueOf(this.brokerController.getBrokerConfig().getStartAcceptSendRequestTimeStamp()));
 
         if (this.brokerController.getMessageStoreConfig().isTimerWheelEnable()) {
-            runtimeInfo.put("timerReadBehind", String.valueOf(this.brokerController.getMessageStore().getTimerMessageStore().getReadBehind()));
-            runtimeInfo.put("timerOffsetBehind", String.valueOf(this.brokerController.getMessageStore().getTimerMessageStore().getOffsetBehind()));
+            runtimeInfo.put("timerReadBehind", String.valueOf(this.brokerController.getMessageStore().getTimerMessageStore().getDequeueBehind()));
+            runtimeInfo.put("timerOffsetBehind", String.valueOf(this.brokerController.getMessageStore().getTimerMessageStore().getEnqueueBehindMessages()));
             runtimeInfo.put("timerCongestNum", String.valueOf(this.brokerController.getMessageStore().getTimerMessageStore().getAllCongestNum()));
             runtimeInfo.put("timerEnqueueTps", String.valueOf(this.brokerController.getMessageStore().getTimerMessageStore().getEnqueueTps()));
             runtimeInfo.put("timerDequeueTps", String.valueOf(this.brokerController.getMessageStore().getTimerMessageStore().getDequeueTps()));
@@ -2273,7 +2420,7 @@ public class AdminBrokerProcessor implements NettyRequestProcessor {
         }
         MessageStore messageStore = this.brokerController.getMessageStore();
         runtimeInfo.put("remainTransientStoreBufferNumbs", String.valueOf(messageStore.remainTransientStoreBufferNumbs()));
-        if (this.brokerController.getMessageStoreConfig().isTransientStorePoolEnable()) {
+        if (this.brokerController.getMessageStore() instanceof DefaultMessageStore && ((DefaultMessageStore) this.brokerController.getMessageStore()).isTransientStorePoolEnable()) {
             runtimeInfo.put("remainHowManyDataToCommit", MixAll.humanReadableByteCount(messageStore.remainHowManyDataToCommit(), false));
         }
         runtimeInfo.put("remainHowManyDataToFlush", MixAll.humanReadableByteCount(messageStore.remainHowManyDataToFlush(), false));
@@ -2593,16 +2740,21 @@ public class AdminBrokerProcessor implements NettyRequestProcessor {
         final ReplicasManager replicasManager = this.brokerController.getReplicasManager();
         assert replicasManager != null;
         final BrokerConfig brokerConfig = this.brokerController.getBrokerConfig();
+        final RemotingCommand response = RemotingCommand.createResponseCommand(null);
+
+        if (!brokerConfig.isEnableControllerMode()) {
+            response.setCode(ResponseCode.SYSTEM_ERROR);
+            response.setRemark("this request only for controllerMode ");
+            return response;
+        }
         final EpochEntryCache entryCache = new EpochEntryCache(brokerConfig.getBrokerClusterName(),
             brokerConfig.getBrokerName(), brokerConfig.getBrokerId(), replicasManager.getEpochEntries(), this.brokerController.getMessageStore().getMaxPhyOffset());
 
-        final RemotingCommand response = RemotingCommand.createResponseCommand(null);
         response.setBody(entryCache.encode());
         response.setCode(ResponseCode.SUCCESS);
         response.setRemark(null);
         return response;
     }
-
 
     private RemotingCommand resetMasterFlushOffset(ChannelHandlerContext ctx,
         RemotingCommand request) throws RemotingCommandException {
@@ -2625,6 +2777,7 @@ public class AdminBrokerProcessor implements NettyRequestProcessor {
     private RemotingCommand notifyBrokerRoleChanged(ChannelHandlerContext ctx,
         RemotingCommand request) throws RemotingCommandException {
         NotifyBrokerRoleChangedRequestHeader requestHeader = (NotifyBrokerRoleChangedRequestHeader) request.decodeCommandCustomHeader(NotifyBrokerRoleChangedRequestHeader.class);
+        SyncStateSet syncStateSetInfo = RemotingSerializable.decode(request.getBody(), SyncStateSet.class);
 
         RemotingCommand response = RemotingCommand.createResponseCommand(null);
 
@@ -2632,7 +2785,11 @@ public class AdminBrokerProcessor implements NettyRequestProcessor {
 
         final ReplicasManager replicasManager = this.brokerController.getReplicasManager();
         if (replicasManager != null) {
-            replicasManager.changeBrokerRole(requestHeader.getMasterAddress(), requestHeader.getMasterEpoch(), requestHeader.getSyncStateSetEpoch(), requestHeader.getBrokerId());
+            try {
+                replicasManager.changeBrokerRole(requestHeader.getMasterBrokerId(), requestHeader.getMasterAddress(), requestHeader.getMasterEpoch(), requestHeader.getSyncStateSetEpoch(), syncStateSetInfo.getSyncStateSet());
+            } catch (Exception e) {
+                throw new RemotingCommandException(e.getMessage());
+            }
         }
         response.setCode(ResponseCode.SUCCESS);
         response.setRemark(null);
@@ -2646,6 +2803,15 @@ public class AdminBrokerProcessor implements NettyRequestProcessor {
             response.setRemark("Can't modify topic or subscription group from slave broker, " +
                 "please execute it from master broker.");
             return true;
+        }
+        return false;
+    }
+
+    private boolean validateBlackListConfigExist(Properties properties) {
+        for (String blackConfig:configBlackList) {
+            if (properties.containsKey(blackConfig)) {
+                return true;
+            }
         }
         return false;
     }

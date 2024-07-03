@@ -32,18 +32,21 @@ import java.util.HashSet;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicInteger;
+
+import org.apache.commons.lang3.StringUtils;
+import org.apache.rocketmq.common.BoundaryType;
+import org.apache.rocketmq.common.constant.LoggerName;
 import org.apache.rocketmq.logging.org.slf4j.Logger;
 import org.apache.rocketmq.logging.org.slf4j.LoggerFactory;
 import org.apache.rocketmq.remoting.CommandCustomHeader;
 import org.apache.rocketmq.remoting.annotation.CFNotNull;
-import org.apache.rocketmq.remoting.common.RemotingHelper;
 import org.apache.rocketmq.remoting.exception.RemotingCommandException;
 
 public class RemotingCommand {
     public static final String SERIALIZE_TYPE_PROPERTY = "rocketmq.serialize.type";
     public static final String SERIALIZE_TYPE_ENV = "ROCKETMQ_SERIALIZE_TYPE";
     public static final String REMOTING_VERSION_KEY = "rocketmq.remoting.version";
-    static final Logger log = LoggerFactory.getLogger(RemotingHelper.ROCKETMQ_REMOTING);
+    static final Logger log = LoggerFactory.getLogger(LoggerName.ROCKETMQ_REMOTING_NAME);
     private static final int RPC_TYPE = 0; // 0, REQUEST_COMMAND
     private static final int RPC_ONEWAY = 1; // 0, RPC
     private static final Map<Class<? extends CommandCustomHeader>, Field[]> CLASS_HASH_MAP =
@@ -61,6 +64,7 @@ public class RemotingCommand {
     private static final String LONG_CANONICAL_NAME_2 = long.class.getCanonicalName();
     private static final String BOOLEAN_CANONICAL_NAME_1 = Boolean.class.getCanonicalName();
     private static final String BOOLEAN_CANONICAL_NAME_2 = boolean.class.getCanonicalName();
+    private static final String BOUNDARY_TYPE_CANONICAL_NAME = BoundaryType.class.getCanonicalName();
     private static volatile int configVersion = -1;
     private static AtomicInteger requestId = new AtomicInteger(0);
 
@@ -68,7 +72,7 @@ public class RemotingCommand {
 
     static {
         final String protocol = System.getProperty(SERIALIZE_TYPE_PROPERTY, System.getenv(SERIALIZE_TYPE_ENV));
-        if (!isBlank(protocol)) {
+        if (!StringUtils.isBlank(protocol)) {
             try {
                 serializeTypeConfigInThisServer = SerializeType.valueOf(protocol);
             } catch (IllegalArgumentException e) {
@@ -85,12 +89,13 @@ public class RemotingCommand {
     private String remark;
     private HashMap<String, String> extFields;
     private transient CommandCustomHeader customHeader;
+    private transient CommandCustomHeader cachedHeader;
 
     private SerializeType serializeTypeCurrentRPC = serializeTypeConfigInThisServer;
 
     private transient byte[] body;
     private boolean suspended;
-    private Stopwatch processTimer;
+    private transient Stopwatch processTimer;
 
     protected RemotingCommand() {
     }
@@ -237,19 +242,6 @@ public class RemotingCommand {
         return serializeTypeConfigInThisServer;
     }
 
-    private static boolean isBlank(String str) {
-        int strLen;
-        if (str == null || (strLen = str.length()) == 0) {
-            return true;
-        }
-        for (int i = 0; i < strLen; i++) {
-            if (!Character.isWhitespace(str.charAt(i))) {
-                return false;
-            }
-        }
-        return true;
-    }
-
     public static int markProtocolType(int source, SerializeType type) {
         return (type.getCode() << 24) | (source & 0x00FFFFFF);
     }
@@ -269,10 +261,19 @@ public class RemotingCommand {
 
     public CommandCustomHeader decodeCommandCustomHeader(
         Class<? extends CommandCustomHeader> classHeader) throws RemotingCommandException {
-        return decodeCommandCustomHeader(classHeader, true);
+        return decodeCommandCustomHeader(classHeader, false);
     }
 
-    public CommandCustomHeader decodeCommandCustomHeader(Class<? extends CommandCustomHeader> classHeader,
+    public CommandCustomHeader decodeCommandCustomHeader(
+        Class<? extends CommandCustomHeader> classHeader, boolean isCached) throws RemotingCommandException {
+        if (isCached && cachedHeader != null) {
+            return cachedHeader;
+        }
+        cachedHeader = decodeCommandCustomHeaderDirectly(classHeader, true);
+        return cachedHeader;
+    }
+
+    public CommandCustomHeader decodeCommandCustomHeaderDirectly(Class<? extends CommandCustomHeader> classHeader,
         boolean useFastEncode) throws RemotingCommandException {
         CommandCustomHeader objectHeader;
         try {
@@ -322,6 +323,8 @@ public class RemotingCommand {
                                 valueParsed = Boolean.parseBoolean(value);
                             } else if (type.equals(DOUBLE_CANONICAL_NAME_1) || type.equals(DOUBLE_CANONICAL_NAME_2)) {
                                 valueParsed = Double.parseDouble(value);
+                            } else if (type.equals(BOUNDARY_TYPE_CANONICAL_NAME)) {
+                                valueParsed = BoundaryType.getType(value);
                             } else {
                                 throw new RemotingCommandException("the custom field <" + fieldName + "> type is not supported");
                             }
@@ -501,7 +504,7 @@ public class RemotingCommand {
         // header data
         result.put(headerData);
 
-        ((Buffer)result).flip();
+        ((Buffer) result).flip();
 
         return result;
     }
@@ -608,9 +611,13 @@ public class RemotingCommand {
 
     public void addExtField(String key, String value) {
         if (null == extFields) {
-            extFields = new HashMap<>();
+            extFields = new HashMap<>(256);
         }
         extFields.put(key, value);
+    }
+
+    public void addExtFieldIfNotExist(String key, String value) {
+        extFields.putIfAbsent(key, value);
     }
 
     @Override

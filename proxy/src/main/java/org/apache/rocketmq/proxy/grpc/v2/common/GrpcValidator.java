@@ -48,38 +48,32 @@ public class GrpcValidator {
     }
 
     public void validateTopic(Resource topic) {
-        validateTopic(GrpcConverter.getInstance().wrapResourceWithNamespace(topic));
+        validateTopic(topic.getName());
     }
 
     public void validateTopic(String topicName) {
-        if (StringUtils.isBlank(topicName)) {
-            throw new GrpcProxyException(Code.ILLEGAL_TOPIC, "topic name cannot be empty");
-        }
-        if (TopicValidator.isSystemTopic(topicName)) {
-            throw new GrpcProxyException(Code.ILLEGAL_TOPIC, "cannot access system topic");
-        }
         try {
             Validators.checkTopic(topicName);
         } catch (MQClientException mqClientException) {
             throw new GrpcProxyException(Code.ILLEGAL_TOPIC, mqClientException.getErrorMessage());
         }
+        if (TopicValidator.isSystemTopic(topicName)) {
+            throw new GrpcProxyException(Code.ILLEGAL_TOPIC, "cannot access system topic");
+        }
     }
 
     public void validateConsumerGroup(Resource consumerGroup) {
-        validateConsumerGroup(GrpcConverter.getInstance().wrapResourceWithNamespace(consumerGroup));
+        validateConsumerGroup(consumerGroup.getName());
     }
 
     public void validateConsumerGroup(String consumerGroupName) {
-        if (StringUtils.isBlank(consumerGroupName)) {
-            throw new GrpcProxyException(Code.ILLEGAL_CONSUMER_GROUP, "consumer group cannot be empty");
-        }
-        if (MixAll.isSysConsumerGroup(consumerGroupName)) {
-            throw new GrpcProxyException(Code.ILLEGAL_CONSUMER_GROUP, "cannot use system consumer group");
-        }
         try {
             Validators.checkGroup(consumerGroupName);
         } catch (MQClientException mqClientException) {
             throw new GrpcProxyException(Code.ILLEGAL_CONSUMER_GROUP, mqClientException.getErrorMessage());
+        }
+        if (MixAll.isSysConsumerGroup(consumerGroupName)) {
+            throw new GrpcProxyException(Code.ILLEGAL_CONSUMER_GROUP, "cannot use system consumer group");
         }
     }
 
